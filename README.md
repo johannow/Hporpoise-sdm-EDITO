@@ -1,1 +1,2 @@
 # Hporpoise-sdm-EDITO
+This tutorial shows how to collect occurrence and environmental data from the EDITO datalake to build a species distribution model. With some slight modifications of the code, this workflow can be run for a species, temporal or spatial extent of your choice. More information on the EditoTools used in this tutorial, can be found at: [EditoTools_documentation](https://github.com/WardStandaert/EditoTools_documentation).
