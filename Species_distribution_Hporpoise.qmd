@@ -1,0 +1,592 @@
+---
+title: "Species_distribution_Hporpoise"
+author: "Jo-Hannes Nowé (VLIZ)"
+format: 
+  html: 
+    theme: yeti
+editor: visual
+toc: true
+number-sections: true
+highlight-style: pygments
+bibliography: references.bib
+csl: apa.csl
+---
+
+```{r folder_structure}
+#| echo: false
+# Define different folders
+downloaddir <- "data/raw_data"
+datadir     <- "data/derived_data"
+envdir <-"data/raw_data/environmental_layers"
+occdir <-"data/raw_data/occurrences"
+spatdir <- "data/raw_data/spatial_layers"
+folderstruc <- c(downloaddir,
+                 datadir,
+                 envdir,
+                 occdir,
+                 spatdir)
+
+#Check for their existence, create if missing
+for(i in 1:length(folderstruc)){
+  if(!dir.exists(folderstruc[i])){
+    # If not, create the folder
+    dir.create(folderstruc[i],recursive = TRUE)
+    cat("Folder created:", folderstruc[i], "\n")
+  } else {
+    cat("Folder already exists:", folderstruc[i], "\n")
+  }
+}
+```
+
+```{r (down)load_packages}
+#| results: false
+#| warning: false
+#| error: false
+#Download the necessary R packages
+#Using the pak R package, multiple packages can be downloaded easily 
+if(!require('pak'))install.packages('pak')
+package_list <- c("arules",
+                  "arrow",
+                  "arulesViz",
+                  "BiocManager",
+                  "CoordinateCleaner",
+                  "dismo",
+                  "doParallel",
+                  "downloader",
+                  "earth",
+                  "foreach",
+                  "ks",
+                  "mgcv",
+                  "ows4R",
+                  "ranger",
+                  "raster",
+                  "Rarr",
+                  "sdm",
+                  "sf",
+                  "sp",
+                  "spatialEco",
+                  "stacks",
+                  "stats",
+                  "stars",
+                  "terra",
+                  "tidymodels",
+                  "tidyverse",
+                  "utils",
+                  "worrms",
+                  "xgboost")
+#For the packages that need to be installed from github
+package_list_github <-c("vlizBE/imis",
+                        "tidymodels/tune")
+pak::pkg_install(c(package_list,package_list_github))
+
+lapply(package_list, library, character.only = TRUE)
+library(imis)
+```
+
+# Introduction
+
+In this notebook we fit a species distribution model to EurOBIS data in the EDITO environment. By altering the choices in the first code chunk, this notebook can be run for a species, study area or time period of choice. This workflow is being updated as improvements are made.
+
+There are 3 main parts in the workflow: the collection of data from the data lake, model training and making predictions.
+
+# Collection of data out of the data lake
+
+In the first part of the analysis, we are setting up the data frame on which we want to build the model. In short we want to have occurrences and background points coupled with their respective values for temperature, salinity, net primary production and bathymetry: the predictors used in the model.
+
+## Defining user choices
+
+First, some choices are made on the species, spatial and temporal extent of the study. By altering this part of the code, you can train a model for your use case.
+
+```{r}
+region <- c('II','III') #ospar region to define the study area
+aphia_id <-137117   #this is Phocoena phocoena
+word_filter <- c("stranding", "museum") #to filter out datasets based on a keyword
+date_start <- "1999-01-01T00:00:00"
+date_end <- "2019-01-01T00:00:00"
+temporal_extent <- lubridate::interval(date_start,date_end)
+```
+
+## Presence data
+
+### Defining the study area
+
+```{r}
+#Download and unzip the ospar shapefiles
+url <- "https://odims.ospar.org/public/submissions/ospar_regions/regions/2017-01/002/ospar_regions_2017_01_002-gis.zip"
+download.file(url,file.path(spatdir,"ospar_REGIONS.zip"),mode="wb")
+unzip(zipfile=file.path(spatdir,"ospar_REGIONS.zip"),exdir=spatdir)
+
+#Visualize the different regions
+ospar<- st_read(file.path(spatdir,"ospar_regions_2017_01_002.shp"))
+
+ospar <- ospar[ospar$Region %in% region,]
+ggplot(data=ospar)+geom_sf()
+#Only keeping the region and geometry info
+ospar<- ospar %>% dplyr::select(Region)
+
+#Bring together the different ospar regions into one area
+spatial_extent <- st_union(ospar)
+
+```
+
+### Downloading occurrence data from EurOBIS
+
+The occurrence data we use comes from EurOBIS. Using the arrow R package, we can pre-filter and manipulate the data before collecting, making these steps fast and efficient.
+
+```{r eurobis_connection}
+acf <- S3FileSystem$create(
+  anonymous = T,
+  scheme = "https",
+  endpoint_override = "s3.waw3-1.cloudferro.com"
+)
+eurobis <- arrow::open_dataset(acf$path("emodnet/biology/eurobis_occurence_data/eurobisgeoparquet/eurobis_no_partition_sorted.parquet"))
+```
+
+```{r eurobis_download}
+bbox <- sf::st_bbox(spatial_extent)
+mydata.eurobis <- eurobis %>%
+  filter(aphiaidaccepted==aphia_id,
+         longitude > bbox[1], longitude < bbox[3],
+         latitude > bbox[2], latitude < bbox[4],
+         observationdate >= as.POSIXct(date_start),
+         observationdate <= as.POSIXct(date_end)) %>%
+  dplyr::select(datasetid,
+                latitude,
+                longitude,
+                time=observationdate,
+                scientific_name = scientificname_accepted,
+                occurrence_id=occurrenceid) %>%
+  mutate(year=year(time),
+         month=month(time),
+         day = day(time))%>%
+  collect()%>%
+  sf::st_as_sf(coords=c("longitude", "latitude"),
+               crs=4326)
+
+```
+
+### Filtering and processing the data
+
+With the custom function `fdr2`from @hermanpmj2020, we can generate metadata on the list of datasets we use the occurrences from. We use this information to further filter the data.
+
+```{r metadata_function}
+#| include: false
+#function to read dataset characteristics, code from: https://github.com/EMODnet/EMODnet-Biology-Benthos_greater_North_Sea
+
+fdr2<-function(dasid){
+  datasetrecords <- datasets(dasid)
+  dascitations <- getdascitations(datasetrecords)
+  if(nrow(dascitations)==0)dascitations<-tibble(dasid=as.character(dasid),title="",citation="")
+  if(nrow(dascitations)==1) if(is.na(dascitations$citation)) dascitations$citation<-""
+  daskeywords <- getdaskeywords(datasetrecords)
+  if(nrow(daskeywords)==0)daskeywords<-tibble(dasid=as.character(dasid),title="",keyword="")
+  if(nrow(daskeywords)==1) if(is.na(daskeywords$keyword))daskeywords$keyword<-""
+  dascontacts <- getdascontacts(datasetrecords)
+  if(nrow(dascontacts)==0)dascontacts<-tibble(dasid=as.character(dasid),title="",contact="")
+  if(nrow(dascontacts)==1) if(is.na(dascontacts$contact))dascontacts$contact<-""
+  dastheme <- getdasthemes(datasetrecords)
+  if(nrow(dastheme)==0)dastheme<-tibble(dasid=as.character(dasid),title="",theme="")
+  if(nrow(dastheme)==1) if(is.na(dastheme$theme))dastheme$theme<-""
+  dastheme2 <- aggregate(theme ~ dasid, data = dastheme, paste, 
+                         collapse = " , ")
+  daskeywords2 <- aggregate(keyword ~ dasid, data = daskeywords, 
+                            paste, collapse = " , ")
+  dascontacts2 <- aggregate(contact ~ dasid, data = dascontacts, 
+                            paste, collapse = " , ")
+  output <- dascitations %>% left_join(dascontacts2, by = "dasid") %>% 
+    left_join(dastheme2, by = "dasid") %>% left_join(daskeywords2, 
+                                                     by = "dasid")
+  return(output)
+}
+```
+
+```{r metadata_creation}
+datasetidsoi <- mydata.eurobis %>% 
+  sf::st_drop_geometry() %>%
+  distinct(datasetid) %>% 
+  mutate(datasetid = as.numeric(str_extract(datasetid, "\\d+")))
+#==== retrieve data by dataset ==============
+all_info <- data.frame()
+for (i in datasetidsoi$datasetid){
+  dataset_info <- fdr2(i)
+  all_info <- rbind(all_info, dataset_info)
+}
+names(all_info)[1]<-"datasetid"
+write.csv(all_info,file=file.path(datadir,"allDatasets.csv"),row.names = F, append=FALSE)
+alldataset <- read.csv(file.path(datadir,"allDatasets.csv"))
+```
+
+We filter the datasets based on keywords such as "museum" and "strandings".
+
+```{r filter_dataset}
+alldataset <- alldataset %>%
+  rowwise() %>%
+  mutate("discard"=any(across(-description, ~grepl(paste(word_filter, collapse = "|"), .,ignore.case=TRUE))))
+
+alldataset_selection<-alldataset%>%
+  filter(discard==FALSE)
+
+alldataset_flagged <- alldataset%>%
+  filter(discard==TRUE)
+```
+
+We also filter out duplicate samples based on coordinates and time of measurement.
+
+```{r filter_occurrences}
+mydata.eurobis <- mydata.eurobis %>%
+  filter(!is.na(time))%>%
+  st_filter(y = spatial_extent)%>%
+  filter(datasetid %in% alldataset_selection$datasetid)%>%
+  dplyr::distinct(occurrence_id,.keep_all = TRUE)%>%
+  arrange(time)%>%
+    mutate(year_month=paste(year,month,sep='-'))%>%
+  mutate(year_month=factor(year_month,levels=unique(year_month),ordered=TRUE))%>%
+  dplyr::mutate(longitude = sf::st_coordinates(.)[,1],
+                latitude = sf::st_coordinates(.)[,2],
+                occurrence_status = 1)%>%
+  dplyr::select(!c(datasetid,occurrence_id))%>%
+  sf::st_drop_geometry()
+
+#Remove duplicates
+mydata.eurobis <- cc_dupl(mydata.eurobis, lon = "longitude", lat = "latitude",value = "clean",species="scientific_name", additions="time")
+```
+
+## Background data
+
+The background data is created using the target-group background method, where the occurrences of other species in the same target group are used to infer the sampling effort [@phillips2009sample].
+
+```{r target_group_choices}
+species <- worrms::wm_id2name(aphia_id)
+classification <- wm_classification(aphia_id) 
+class <- which(classification[,2]=="Class")
+target_group <- classification[[class,3]]
+```
+
+Occurrences from the target group in the same datasets as our occurrences are downloaded.
+
+```{r download_target_group}
+list_dasid <- alldataset_selection$datasetid
+
+#Some workaround to get the Class information while it is not in the parquet file
+#Generate a list of all the distinct aphiaids over the datasets
+aphiaid_list <- eurobis %>%
+  filter(datasetid %in% list_dasid,
+         longitude > bbox[1], longitude < bbox[3],
+         latitude > bbox[2], latitude < bbox[4],
+         observationdate >= as.POSIXct(date_start),
+         observationdate <= as.POSIXct(date_end)) %>%
+  dplyr::select(aphiaid) %>%
+  distinct()%>%
+  collect()
+
+#Check which of the aphiaids belong to the target group
+result <- tibble(Class=purrr::map_vec(aphiaid_list$aphiaid, \(x) ifelse(any(worrms::wm_classification(x)$rank == "Class"),
+                 worrms::wm_classification(x)[[which(worrms::wm_classification(x)$rank == "Class"), 3]],
+                 NA)))
+#returns some empty columns, because e.g Reptilia don't have the class trait and some other aphiaids don't go to class level.
+
+#Keep in this list the aphiaIDs of the target_group
+class_list <- cbind(aphiaid_list, result)
+class_list_filtered <- class_list%>%
+  filter(Class==target_group)
+
+target_background <- eurobis %>%
+  filter(datasetid %in% list_dasid,
+         aphiaidaccepted %in% class_list_filtered$aphiaid,
+         longitude > bbox[1], longitude < bbox[3],
+         latitude > bbox[2], latitude < bbox[4],
+         observationdate >= as.POSIXct(date_start),
+         observationdate <= as.POSIXct(date_end)) %>%
+  dplyr::select(datasetid,
+                latitude,
+                longitude,
+                time=observationdate,
+                scientific_name = scientificname_accepted,
+                occurrence_id = occurrenceid) %>%
+  mutate(year=year(time),
+         month=month(time),
+         day = day(time))%>%
+  collect()%>%
+  sf::st_as_sf(coords=c("longitude", "latitude"),
+               crs=4326)
+
+target_background <- target_background %>%
+  filter(!is.na(time))%>%
+  st_filter(y = spatial_extent)%>%
+  dplyr::distinct(occurrence_id,.keep_all = TRUE)%>%
+  arrange(time)%>%
+    mutate(year_month=paste(year,month,sep='-'))%>%
+  mutate(year_month=factor(year_month,levels=unique(year_month),ordered=TRUE))%>%
+  dplyr::mutate(longitude = sf::st_coordinates(.)[,1],
+                latitude = sf::st_coordinates(.)[,2],
+                occurrence_status = 0)%>%
+  dplyr::select(!c(datasetid,occurrence_id))%>%
+  sf::st_drop_geometry()
+```
+
+```{r}
+pa_occurrence <- rbind(mydata.eurobis, target_background)
+summary(pa_occurrence)
+```
+
+## Environmental data layers
+
+We collect the environmental data corresponding to the presence/background points, which is stored in .zarr format in the datalake. This is done by using the editoTools.
+
+```{r}
+source("editoTools.R")
+```
+
+We define our environmental variables: temperature, salinity, net primary production and bathymetry.
+
+```{r}
+parameters <- list(
+  "thetao"= c("par" = "thetao", "fun" = "mean"),
+  "so"= c("par" = "so", "fun" = "mean"),
+  "npp"= c("par" = "npp", "fun" = "mean", "convert_from_timestep" = "86400000"),
+  "elevation"=c("par"= "elevation", "fun"="mean"))
+```
+
+```{r}
+#Takes +- 1 min for thetao and so, 45min for npp, 5 for bathymetry
+df_occ <- enhanceDF(inputPoints = pa_occurrence %>% 
+                            mutate(Time = as.POSIXct(paste(year,month,1,sep = "-")))%>%
+                                     dplyr::select(Time,Longitude=longitude,Latitude=latitude,occurrenceStatus=occurrence_status),
+                          requestedParameters = parameters,
+                          requestedTimeSteps = NA,
+                          stacCatalogue = EDITOSTAC,
+                          verbose="",
+                          select_layers=rep(1,4))
+df_occ <- df_occ %>% na.omit()
+```
+
+# Model training
+
+We use the data frame with environmental values as input data for the model. The model is trained using the tidymodels R package.
+
+```{r}
+#Turn our occurrence into a factor so that there are two known levels, either presence or absence.
+df_occ$occurrenceStatus<-factor(df_occ$occurrenceStatus)
+
+data <- df_occ%>%
+  dplyr::select(occurrenceStatus,thetao,so,npp,elevation)%>%
+  drop_na()%>%
+  as_tibble()
+```
+
+```{r}
+# Data splitting
+set.seed(222)
+#Put 4/5 in the training set
+data_split<- initial_split(data, prop=4/5)
+
+#Create data frames for the two sets:
+train_data <- training(data_split)
+test_data <- testing(data_split)
+
+#Create folds in the training data so we can do our validation.
+#Out of the 80% reserved for training data, use 10% each time for validation
+#This is why we choose the number of folds v=8
+folds <- vfold_cv(train_data, v=8)
+folds
+
+Occurrence_rec <- 
+  recipe(occurrenceStatus ~., data=train_data)%>%
+  step_normalize(all_numeric_predictors())
+```
+
+```{r}
+#Because we use tune_grid()
+ctrl_grid <- control_stack_grid()
+ctrl_res <- control_stack_resamples()
+
+
+#Unregister the parallel nodes, parallelised in the editoTools
+unregister <- function() {
+  env <- foreach:::.foreachGlobals
+  rm(list=ls(name=env), pos=env)
+}
+unregister()
+```
+
+First a Random Forest, Generalized Additive Model (GAM), MARS and XGBoost model are fitted on the training data. Afterwards the most optimal combination of the model configurations is put together into an ensemble model.
+
+```{r}
+rf_mod <- rand_forest(trees=500,mode="classification",engine="ranger")
+
+rf_wf <-
+  workflow() %>%
+  add_model(rf_mod) %>%
+  add_recipe(Occurrence_rec)
+
+rf_fit <-
+  fit_resamples(
+    rf_wf,
+    resamples = folds,
+    control = ctrl_res
+  )
+```
+
+```{r}
+gam_mod <- gen_additive_mod(adjust_deg_free = tune()) %>% 
+  set_engine("mgcv") %>% 
+  set_mode("classification")
+gam_wf <-
+  workflow()%>%
+  add_recipe(Occurrence_rec)%>%
+  add_model(gam_mod, formula = occurrenceStatus ~ s(elevation)+ s(thetao)+ s(so) + s(npp))
+gam_grid <- grid_regular(adjust_deg_free(),
+                         levels=4)
+gam_fit <-
+  gam_wf%>%
+  tune_grid(
+    resamples = folds,
+    grid=gam_grid,
+    control=ctrl_grid
+  )
+```
+
+```{r}
+xgb_mod <- boost_tree(
+  trees = tune(),
+  tree_depth = tune(),
+  learn_rate = tune()
+) %>%
+  set_engine("xgboost") %>%
+  set_mode("classification")
+xgb_wf <- workflow() %>%
+  add_model(xgb_mod) %>%
+  add_recipe(Occurrence_rec)
+
+xgb_grid <- parameters(trees(),
+                       tree_depth(c(3,20)),
+                       learn_rate(c(-4,0)))
+xgb_grid <- grid_regular(xgb_grid,
+                         levels=c(trees=5,tree_depth=3,learn_rate=3))
+xgb_fit <- 
+  xgb_wf %>% 
+  tune_grid(
+    resamples = folds,
+    grid = xgb_grid,
+    control=ctrl_grid)
+```
+
+```{r}
+mars_mod <- 
+  mars(prod_degree = tune(), prune_method = tune()) %>% 
+  set_mode("classification") %>% 
+  set_engine("earth")#,glm=list(family=binomial))
+mars_mod
+mars_grid <- grid_regular(prod_degree(),prune_method(),
+                          levels=c(prod_degree=2,prune_method=2))
+mars_wf <-
+  workflow()%>%
+  add_model(mars_mod)%>%
+  add_recipe(Occurrence_rec) 
+mars_fit <-
+  mars_wf%>%
+  tune_grid(
+    resamples = folds,
+    grid=mars_grid,
+    control=ctrl_grid
+  )
+```
+
+```{r}
+#Stacking the individual models into an ensemble model
+
+stack_data <- 
+  stacks() %>%
+  add_candidates(rf_fit) %>%
+  add_candidates(mars_fit)%>%
+  add_candidates(gam_fit)%>%
+  add_candidates(xgb_fit)
+
+stack_mod <-
+  stack_data %>%
+  blend_predictions()
+
+#Fitting the model on the whole training set
+stack_fit <-
+  stack_mod %>%
+  fit_members()
+stack_fit #the final model
+```
+
+# Making monthly predictions
+
+Using the `getRasterSlice` from the `editoTools` we collect monthly raster layers to make predictions on habitat suitability for the study area in that month.
+
+```{r}
+monthly_dates <- seq(from= as.POSIXct(date_start), to= as.POSIXct(date_end), by = "month")
+variables <- rep(names(parameters),each=length(monthly_dates))
+layer_names <- tibble("month"=rep(monthly_dates,length(parameters)))%>%
+  mutate(variable= variables)
+raster_list<-map2(layer_names$variable,layer_names$month, \(variable,month) getRasterSlice(variable,
+                                      stacCatalogue = EDITOSTAC,
+                                                  lon_min = bbox[1],
+                                      lon_max = bbox[3],
+                                      lat_min = bbox[2],
+                                      lat_max = bbox[4],
+                                      requestedTimeSteps = NA,
+                                      date = month,
+                                      select_layers = 1))
+
+thetao <- raster_list[1:length(monthly_dates)]
+so <- raster_list[(length(monthly_dates)+1):(2*length(monthly_dates))]
+npp <- raster_list[(2*length(monthly_dates)+1):length(raster_list)]
+
+
+bathy_url <- EDITOSTAC[EDITOSTAC$par=="elevation","href"][4,]
+new_bathy_url <- sprintf('ZARR:"/vsicurl?list_dir=no&retry_delay=60&max_retry=3&url=%s":/%s',url,"elevation")
+bathy_raster <- terra::rast(new_bathy_url)
+```
+
+```{r}
+prediction <- predict(stack_fit,test_data)%>%
+  bind_cols(predict(stack_fit,test_data, type="prob")) %>%
+  bind_cols(test_data %>%
+              dplyr::select(occurrenceStatus))
+prediction
+accuracy_vec(prediction$occurrenceStatus,prediction$.pred_class)
+```
+
+```{r}
+#Make a custom function that can be used with the terra::predict function
+predprob <- function(...) predict(...,type="prob")$.pred_1
+```
+
+```{r}
+
+#Load the different layers (see environmental clean script)
+thetao <- terra::rast(thetao)
+so <- terra::rast(so)
+npp <- terra::rast(npp)
+#Different layers, crop them to the same extent of bathymetry raster
+thetao <- crop(thetao,bathy_raster) 
+so <- crop(so,bathy_raster)
+npp <- crop(npp,bathy_raster)
+ext(bathy_raster) <- ext(thetao)
+bathy_raster <- resample(bathy_raster, thetao)
+monthly_prediction <- list()
+#Loop over every monthly layer
+for(i in 1:nlyr(thetao)){
+  monthly_info <- c(thetao[[i]],so[[i]],npp[[i]],bathy_raster)
+  #Delete the NA values
+  mask <- !is.na(monthly_info)
+  monthly_info <- terra::mask(monthly_info,mask)
+  #To make sure the names of the layers correspond to the names the model was trained on
+  names(monthly_info) <- c(
+    "thetao",
+    "so","npp","elevation")
+  monthly_prediction[[i]] <- predict(monthly_info,stack_fit,fun=predprob,na.rm=TRUE)
+}
+#To turn it into a raster layer  
+monthly_prediction <- rast(monthly_prediction)
+```
+
+```{r}
+writeCDF(monthly_prediction,file.path(datadir,paste0("monthly_predictions_",aphia_id,".nc")))
+```
+
+# References
