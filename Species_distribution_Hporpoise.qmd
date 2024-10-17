@@ -334,7 +334,7 @@ summary(pa_occurrence)
 We collect the environmental data corresponding to the presence/background points, which is stored in .zarr format in the datalake. This is done by using the editoTools.
 
 ```{r}
-source("editoTools.R")
+source("https://raw.githubusercontent.com/EDITO-Infra/R_tools/main/editoTools.R")
 ```
 
 We define our environmental variables: temperature, salinity, net primary production and bathymetry.
