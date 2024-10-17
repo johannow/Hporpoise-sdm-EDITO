@@ -538,7 +538,7 @@ npp <- raster_list[(2*length(monthly_dates)+1):length(raster_list)]
 
 
 bathy_url <- EDITOSTAC[EDITOSTAC$par=="elevation","href"][4,]
-new_bathy_url <- sprintf('ZARR:"/vsicurl?list_dir=no&retry_delay=60&max_retry=3&url=%s":/%s',url,"elevation")
+new_bathy_url <- sprintf('ZARR:"/vsicurl?list_dir=no&retry_delay=60&max_retry=3&url=%s":/%s',bathy_url,"elevation")
 bathy_raster <- terra::rast(new_bathy_url)
 ```
 
