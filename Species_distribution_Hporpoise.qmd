@@ -38,13 +38,11 @@ for(i in 1:length(folderstruc)){
 }
 ```
 
-```{r (down)load_packages}
+```{r load_packages}
 #| results: false
 #| warning: false
 #| error: false
-#Download the necessary R packages
-#Using the pak R package, multiple packages can be downloaded easily 
-if(!require('pak'))install.packages('pak')
+#Load the necessary R packages
 package_list <- c("arules",
                   "arrow",
                   "arulesViz",
@@ -75,11 +73,8 @@ package_list <- c("arules",
                   "worrms",
                   "xgboost")
 #For the packages that need to be installed from github
-package_list_github <-c("vlizBE/imis",
-                        "tidymodels/tune")
-pak::pkg_install(c(package_list,package_list_github))
-
-lapply(package_list, library, character.only = TRUE)
+package_list_github <-c("vlizBE/imis")
+invisible(lapply(package_list, library, character.only = TRUE,quietly=TRUE))
 library(imis)
 ```
 
