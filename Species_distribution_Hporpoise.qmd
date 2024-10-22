@@ -280,19 +280,15 @@ aphiaid_list <- eurobis %>%
   collect()
 
 #Check which of the aphiaids belong to the target group
-result <- tibble(Class=purrr::map_vec(aphiaid_list$aphiaid, \(x) ifelse(any(worrms::wm_classification(x)$rank == "Class"),
-                 worrms::wm_classification(x)[[which(worrms::wm_classification(x)$rank == "Class"), 3]],
-                 NA)))
-#returns some empty columns, because e.g Reptilia don't have the class trait and some other aphiaids don't go to class level.
-
-#Keep in this list the aphiaIDs of the target_group
-class_list <- cbind(aphiaid_list, result)
-class_list_filtered <- class_list%>%
-  filter(Class==target_group)
+target_aphiaids <- worrms::wm_classification_(aphiaid_list[[1]])%>%
+  dplyr::filter(rank == "Class",
+                scientificname==target_group)%>%
+  dplyr::select(aphiaid=as.numeric("id"))%>%
+  dplyr::mutate(aphiaid=as.numeric(aphiaid))
 
 target_background <- eurobis %>%
   filter(datasetid %in% list_dasid,
-         aphiaidaccepted %in% class_list_filtered$aphiaid,
+         aphiaidaccepted %in% target_aphiaids$aphiaid,
          longitude > bbox[1], longitude < bbox[3],
          latitude > bbox[2], latitude < bbox[4],
          observationdate >= as.POSIXct(date_start),
