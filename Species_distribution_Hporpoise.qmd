@@ -555,8 +555,6 @@ predprob <- function(...) predict(...,type="prob")$.pred_1
 thetao <- crop(thetao,bathy_raster) 
 so <- crop(so,bathy_raster)
 npp <- crop(npp,bathy_raster)
-ext(bathy_raster) <- ext(thetao)
-bathy_raster <- resample(bathy_raster, thetao)
 monthly_prediction <- list()
 #Loop over every monthly layer
 for(i in 1:nlyr(thetao)){
