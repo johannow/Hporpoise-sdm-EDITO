@@ -510,8 +510,9 @@ Using the `getRasterSlice` from the `editoTools` we collect monthly raster layer
 
 ```{r}
 monthly_dates <- seq(from= as.POSIXct(date_start), to= as.POSIXct(date_end), by = "month")
-variables <- rep(names(parameters),each=length(monthly_dates))
-layer_names <- tibble("month"=rep(monthly_dates,length(parameters)))%>%
+#We exclude bathymetry as we only need to load it once, without time information
+variables <- rep(names(parameters[1:3]),each=length(monthly_dates))
+layer_names <- tibble("month"=rep(monthly_dates,length(parameters)-1))%>%
   mutate(variable= variables)
 raster_list<-map2(layer_names$variable,layer_names$month, \(variable,month) getRasterSlice(variable,
                                       stacCatalogue = EDITOSTAC,
@@ -523,17 +524,19 @@ raster_list<-map2(layer_names$variable,layer_names$month, \(variable,month) getR
                                       date = month,
                                       select_layers = 1))
 
-thetao <- raster_list[1:length(monthly_dates)]
-so <- raster_list[(length(monthly_dates)+1):(2*length(monthly_dates))]
-npp <- raster_list[(2*length(monthly_dates)+1):length(raster_list)]
+thetao <- terra::rast(raster_list[1:length(monthly_dates)])
+so <- terra::rast(raster_list[(length(monthly_dates)+1):(2*length(monthly_dates))])
+npp <- terra::rast(raster_list[(2*length(monthly_dates)+1):length(raster_list)])
 
 
 bathy_url <- EDITOSTAC[EDITOSTAC$par=="elevation","href"][4,]
 new_bathy_url <- sprintf('ZARR:"/vsicurl?list_dir=no&retry_delay=60&max_retry=3&url=%s":/%s',bathy_url,"elevation")
-bathy_raster <- terra::rast(new_bathy_url)
+#Without resampling the resolution of the bathymetry is too high
+bathy_raster <- resample(terra::rast(new_bathy_url),thetao)
 ```
 
 ```{r}
+#An overall prediction accuracy on the test set
 prediction <- predict(stack_fit,test_data)%>%
   bind_cols(predict(stack_fit,test_data, type="prob")) %>%
   bind_cols(test_data %>%
@@ -548,11 +551,6 @@ predprob <- function(...) predict(...,type="prob")$.pred_1
 ```
 
 ```{r}
-
-#Load the different layers (see environmental clean script)
-thetao <- terra::rast(thetao)
-so <- terra::rast(so)
-npp <- terra::rast(npp)
 #Different layers, crop them to the same extent of bathymetry raster
 thetao <- crop(thetao,bathy_raster) 
 so <- crop(so,bathy_raster)
